@@ -1,0 +1,7 @@
+fastapi==0.134.0
+uvicorn[standard]==0.41.0
+opencv-python-headless>=4.10.0
+mediapipe>=0.10.32
+numpy
+freenect
+pyusb
