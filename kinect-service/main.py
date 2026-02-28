@@ -44,6 +44,62 @@ POSE_CONNS = [
     (15, 17), (15, 19), (15, 21), (16, 18), (16, 20), (16, 22),
 ]
 KEY_POINTS = {0, 11, 12, 15, 16, 23, 24, 27, 28}
+NUM_LANDMARKS = 33
+
+
+# --- Landmark smoothing (EMA) ---
+class LandmarkSmoother:
+    """Exponential moving average smoother for pose landmarks."""
+
+    def __init__(self, alpha=0.4):
+        self.alpha = alpha  # 0 = full smoothing, 1 = no smoothing
+        self.prev = None
+
+    def smooth(self, landmarks):
+        """Smooth landmark positions. Returns list of dicts with smoothed x,y,z,v."""
+        curr = [
+            {"x": l.x, "y": l.y, "z": l.z, "v": l.visibility}
+            for l in landmarks
+        ]
+        if self.prev is None:
+            self.prev = curr
+            return curr
+
+        smoothed = []
+        for i in range(len(curr)):
+            if curr[i]["v"] < 0.3:
+                smoothed.append(curr[i])
+            else:
+                smoothed.append({
+                    "x": self.alpha * curr[i]["x"] + (1 - self.alpha) * self.prev[i]["x"],
+                    "y": self.alpha * curr[i]["y"] + (1 - self.alpha) * self.prev[i]["y"],
+                    "z": self.alpha * curr[i]["z"] + (1 - self.alpha) * self.prev[i]["z"],
+                    "v": curr[i]["v"],
+                })
+        self.prev = smoothed
+        return smoothed
+
+    def reset(self):
+        self.prev = None
+
+
+# --- Depth temporal smoother ---
+class DepthSmoother:
+    """Rolling average over N depth frames to reduce noise."""
+
+    def __init__(self, window=3):
+        self.window = window
+        self.frames = []
+
+    def smooth(self, depth):
+        self.frames.append(depth.astype(np.float32))
+        if len(self.frames) > self.window:
+            self.frames.pop(0)
+        if len(self.frames) == 1:
+            return depth
+        stack = np.stack(self.frames, axis=0)
+        return np.mean(stack, axis=0).astype(np.uint16)
+
 
 # --- Constants ---
 JPEG_Q = [cv2.IMWRITE_JPEG_QUALITY, 80]
@@ -140,9 +196,10 @@ def raw_to_mm(raw: float) -> int:
 
 
 def compute_zone(landmarks, depth, w=640, h=480):
+    """Compute zone from smoothed landmark dicts."""
     lh, rh = landmarks[23], landmarks[24]
-    cx = int((lh.x + rh.x) / 2 * w)
-    cy = int((lh.y + rh.y) / 2 * h)
+    cx = int((lh["x"] + rh["x"]) / 2 * w)
+    cy = int((lh["y"] + rh["y"]) / 2 * h)
 
     zh = "left" if cx < w / 3 else ("center" if cx < 2 * w / 3 else "right")
 
@@ -164,22 +221,23 @@ def compute_zone(landmarks, depth, w=640, h=480):
     return zh, zd, dist
 
 
-# --- Skeleton drawing (overlaid on RGB) ---
+# --- Skeleton drawing (overlaid on RGB, uses smoothed dicts) ---
 def draw_skeleton(img, landmarks, w=640, h=480):
+    """Draw skeleton from smoothed landmark dicts (keys: x, y, z, v)."""
     out = img.copy()
 
     for start, end in POSE_CONNS:
         s, e = landmarks[start], landmarks[end]
-        if s.visibility < 0.3 or e.visibility < 0.3:
+        if s["v"] < 0.3 or e["v"] < 0.3:
             continue
-        pt1 = (int(s.x * w), int(s.y * h))
-        pt2 = (int(e.x * w), int(e.y * h))
+        pt1 = (int(s["x"] * w), int(s["y"] * h))
+        pt2 = (int(e["x"] * w), int(e["y"] * h))
         cv2.line(out, pt1, pt2, (0, 255, 136), 2, cv2.LINE_AA)
 
     for i, lm in enumerate(landmarks):
-        if lm.visibility < 0.3:
+        if lm["v"] < 0.3:
             continue
-        pt = (int(lm.x * w), int(lm.y * h))
+        pt = (int(lm["x"] * w), int(lm["y"] * h))
         r = 5 if i in KEY_POINTS else 3
         cv2.circle(out, pt, r, (0, 200, 255), -1, cv2.LINE_AA)
         cv2.circle(out, pt, r, (0, 100, 200), 1, cv2.LINE_AA)
@@ -190,6 +248,8 @@ def draw_skeleton(img, landmarks, w=640, h=480):
 # --- Capture thread ---
 def capture_loop():
     frame_times = []
+    lm_smoother = LandmarkSmoother(alpha=0.4)  # 0.4 = moderate smoothing
+    depth_smoother = DepthSmoother(window=3)    # Average 3 depth frames
 
     landmarker = vision.PoseLandmarker.create_from_options(
         vision.PoseLandmarkerOptions(
@@ -205,12 +265,14 @@ def capture_loop():
 
     while True:
         try:
-            t0 = time.monotonic()
             rgb, _ = freenect.sync_get_video()
-            depth, _ = freenect.sync_get_depth()
-            if rgb is None or depth is None:
+            depth_raw, _ = freenect.sync_get_depth()
+            if rgb is None or depth_raw is None:
                 time.sleep(0.05)
                 continue
+
+            # Smooth depth temporally
+            depth = depth_smoother.smooth(depth_raw)
 
             rgb_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
@@ -222,23 +284,27 @@ def capture_loop():
             presence = len(result.pose_landmarks) > 0
             conf, zh, zd, dist, lm_list = 0.0, "unknown", "unknown", 0, None
 
-            # Draw skeleton overlay on RGB
             display_bgr = rgb_bgr
             if presence:
-                lm = result.pose_landmarks[0]
-                conf = round(float(np.mean([l.visibility for l in lm])), 3)
-                zh, zd, dist = compute_zone(lm, depth)
+                raw_lm = result.pose_landmarks[0]
+                conf = round(float(np.mean([l.visibility for l in raw_lm])), 3)
+
+                # Smooth landmarks for stable display
+                smoothed = lm_smoother.smooth(raw_lm)
+                zh, zd, dist = compute_zone(smoothed, depth)
                 lm_list = [
-                    {"x": round(l.x, 4), "y": round(l.y, 4),
-                     "z": round(l.z, 4), "v": round(l.visibility, 3)}
-                    for l in lm
+                    {"x": round(l["x"], 4), "y": round(l["y"], 4),
+                     "z": round(l["z"], 4), "v": round(l["v"], 3)}
+                    for l in smoothed
                 ]
-                display_bgr = draw_skeleton(rgb_bgr, lm)
+                display_bgr = draw_skeleton(rgb_bgr, smoothed)
                 cv2.putText(display_bgr, f"{zh} / {zd}", (10, 30),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 136), 2)
                 if dist > 0:
                     cv2.putText(display_bgr, f"{dist / 1000:.1f}m", (10, 60),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 136), 2)
+            else:
+                lm_smoother.reset()
 
             # Encode
             _, rb = cv2.imencode(".jpg", display_bgr, JPEG_Q)
@@ -251,8 +317,6 @@ def capture_loop():
 
             state.update(rb.tobytes(), db.tobytes(),
                          presence, conf, zh, zd, dist, lm_list, len(frame_times))
-
-            # No artificial throttle — let MediaPipe heavy model pace naturally
 
         except Exception as e:
             print(f"capture error: {e}", flush=True)
