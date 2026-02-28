@@ -249,7 +249,7 @@ def draw_skeleton(img, landmarks, w=640, h=480):
 def capture_loop():
     frame_times = []
     lm_smoother = LandmarkSmoother(alpha=0.4)  # 0.4 = moderate smoothing
-    depth_smoother = DepthSmoother(window=3)    # Average 3 depth frames
+    # Depth smoothing removed — causes ghosting/doubling on movement
 
     landmarker = vision.PoseLandmarker.create_from_options(
         vision.PoseLandmarkerOptions(
@@ -271,9 +271,7 @@ def capture_loop():
                 time.sleep(0.05)
                 continue
 
-            # Smooth depth temporally
-            depth = depth_smoother.smooth(depth_raw)
-
+            depth = depth_raw
             rgb_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
             # MediaPipe detection
