@@ -103,6 +103,14 @@ class DepthSmoother:
 
 # --- Constants ---
 JPEG_Q = [cv2.IMWRITE_JPEG_QUALITY, 80]
+
+# Night mode: Kinect v1 streams RGB *or* IR on its video endpoint, never both. The IR camera is lit by the depth
+# projector's dots, so it sees in a dark room. "auto" switches to IR after the RGB frame is dark for DARK_SECS and
+# probes RGB every RECHECK_SECS to switch back when the lights come on.
+DARK_LUMA, BRIGHT_LUMA = 30, 45          # mean brightness 0-255 of an RGB frame
+DARK_SECS, RECHECK_SECS = 10, 60
+# A side view drops the pose for a few frames at a time: report "seen N s ago" so consumers can hold presence.
+SEEN_CONF = 0.3
 COLORMAPS = {
     "turbo": cv2.COLORMAP_TURBO, "inferno": cv2.COLORMAP_INFERNO,
     "plasma": cv2.COLORMAP_PLASMA, "jet": cv2.COLORMAP_JET,
@@ -126,6 +134,9 @@ class State:
         self.landmarks: Optional[list] = None
         self.depth_mode = "turbo"
         self.fps = 0.0
+        self.video_mode_pref = "auto"  # auto | rgb | ir
+        self.video_mode = "rgb"        # what is streaming right now
+        self.last_seen = 0.0           # monotonic time of the last pose with confidence >= SEEN_CONF
 
     def update(self, rgb_j, depth_j, presence, conf, zh, zd, dist, lm, fps, raw_j=None):
         with self._lock:
@@ -247,6 +258,56 @@ def draw_skeleton(img, landmarks, w=640, h=480):
     return out
 
 
+# --- Night mode helpers ---
+def ir_to_rgb(ir: np.ndarray) -> np.ndarray:
+    """8-bit IR (640x488 on K4W) -> 640x480 RGB with stretched contrast (raw IR is dim and low-contrast)."""
+    g = np.ascontiguousarray(ir[:480, :640]).astype(np.uint8)
+    lo, hi = np.percentile(g, 1), np.percentile(g, 99)
+    if hi > lo:
+        g = np.clip((g.astype(np.float32) - lo) / (hi - lo), 0, 1)
+        g = (np.power(g, 0.6) * 255).astype(np.uint8)  # gamma: lift the dark room
+    g = cv2.medianBlur(g, 3)  # soften the projector's dot speckle a little
+    return cv2.cvtColor(g, cv2.COLOR_GRAY2RGB)
+
+
+_night = {"dark_since": None, "last_probe": 0.0, "fmt": None}
+
+
+def get_video(fmt):
+    """sync_get_video with a clean restart on format change: libfreenect's sync wrapper returns all-black RGB frames
+    after an in-place IR -> RGB switch on the K4W (measured 2026-10-17), so stop the stream and let it reopen."""
+    if _night["fmt"] is not None and _night["fmt"] != fmt:
+        freenect.sync_stop()
+        time.sleep(0.3)
+    _night["fmt"] = fmt
+    return freenect.sync_get_video(0, fmt)
+
+
+def auto_video_mode(mode: str, frame: np.ndarray) -> str:
+    """Pick rgb/ir for the NEXT frame. In IR we can't see room light, so probe RGB once a minute."""
+    now = time.monotonic()
+    if mode == "rgb":
+        if float(frame.mean()) < DARK_LUMA:
+            _night["dark_since"] = _night["dark_since"] or now
+            if now - _night["dark_since"] >= DARK_SECS:
+                _night["dark_since"], _night["last_probe"] = None, now
+                print("night mode: room dark -> IR", flush=True)
+                return "ir"
+        else:
+            _night["dark_since"] = None
+        return "rgb"
+    if now - _night["last_probe"] < RECHECK_SECS:
+        return "ir"
+    _night["last_probe"] = now
+    probe = None
+    for _ in range(10):  # auto-exposure needs a few frames after the format switch
+        probe, _ = get_video(freenect.VIDEO_RGB)
+    if probe is not None and float(probe.mean()) > BRIGHT_LUMA:
+        print("night mode: lights on -> RGB", flush=True)
+        return "rgb"
+    return "ir"
+
+
 # --- Capture thread ---
 def capture_loop():
     frame_times = []
@@ -267,11 +328,19 @@ def capture_loop():
 
     while True:
         try:
-            rgb, _ = freenect.sync_get_video()
+            mode = state.video_mode_pref if state.video_mode_pref in ("rgb", "ir") else state.video_mode
+            if mode == "ir":
+                ir, _ = get_video(freenect.VIDEO_IR_8BIT)
+                rgb = None if ir is None else ir_to_rgb(ir)
+            else:
+                rgb, _ = get_video(freenect.VIDEO_RGB)
             depth_raw, _ = freenect.sync_get_depth()
             if rgb is None or depth_raw is None:
                 time.sleep(0.05)
                 continue
+            if state.video_mode_pref == "auto":
+                mode = auto_video_mode(mode, rgb)
+            state.video_mode = mode
 
             depth = depth_raw
             rgb_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
@@ -288,6 +357,8 @@ def capture_loop():
             if presence:
                 raw_lm = result.pose_landmarks[0]
                 conf = round(float(np.mean([l.visibility for l in raw_lm])), 3)
+                if conf >= SEEN_CONF:
+                    state.last_seen = time.monotonic()
 
                 # Smooth landmarks for stable display
                 smoothed = lm_smoother.smooth(raw_lm)
@@ -371,6 +442,8 @@ async def get_status():
         "ok": True, "fps": s["fps"],
         "presence": s["presence"], "confidence": s["confidence"],
         "zone": s["zone"], "depth_mode": state.depth_mode,
+        "video_mode": state.video_mode, "video_mode_pref": state.video_mode_pref,
+        "seen_ago_s": round(time.monotonic() - state.last_seen, 1) if state.last_seen else None,
     }
 
 
@@ -407,6 +480,18 @@ async def post_led(req: LedReq):
         return {"ok": False, "error": "LED not available"}
     ret = _sync.freenect_sync_set_led(req.led, 0)
     return {"ok": ret == 0, "led": req.led}
+
+
+class VideoModeReq(BaseModel):
+    mode: str
+
+
+@app.post("/video_mode")
+async def post_video_mode(req: VideoModeReq):
+    if req.mode not in ("auto", "rgb", "ir"):
+        return JSONResponse({"error": "mode must be auto, rgb or ir"}, 400)
+    state.video_mode_pref = req.mode
+    return {"ok": True, "mode": req.mode}
 
 
 class VizReq(BaseModel):
