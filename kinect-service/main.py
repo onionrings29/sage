@@ -117,6 +117,7 @@ class State:
         self.frame_id = 0
         self.rgb_jpeg: Optional[bytes] = None
         self.depth_jpeg: Optional[bytes] = None
+        self.raw_jpeg: Optional[bytes] = None  # clean RGB, no overlay (Frigate)
         self.presence = False
         self.confidence = 0.0
         self.zone_h = "unknown"
@@ -126,10 +127,11 @@ class State:
         self.depth_mode = "turbo"
         self.fps = 0.0
 
-    def update(self, rgb_j, depth_j, presence, conf, zh, zd, dist, lm, fps):
+    def update(self, rgb_j, depth_j, presence, conf, zh, zd, dist, lm, fps, raw_j=None):
         with self._lock:
             self.frame_id += 1
             self.rgb_jpeg = rgb_j
+            self.raw_jpeg = raw_j
             self.depth_jpeg = depth_j
             self.presence = presence
             self.confidence = conf
@@ -143,7 +145,7 @@ class State:
         with self._lock:
             return dict(
                 frame_id=self.frame_id,
-                rgb_jpeg=self.rgb_jpeg, depth_jpeg=self.depth_jpeg,
+                rgb_jpeg=self.rgb_jpeg, depth_jpeg=self.depth_jpeg, raw_jpeg=self.raw_jpeg,
                 presence=self.presence, confidence=self.confidence,
                 zone=dict(horizontal=self.zone_h, depth=self.zone_d,
                           distance_mm=self.distance_mm),
@@ -307,6 +309,7 @@ def capture_loop():
             # Encode
             _, rb = cv2.imencode(".jpg", display_bgr, JPEG_Q)
             _, db = cv2.imencode(".jpg", render_depth(depth), JPEG_Q)
+            _, raw = cv2.imencode(".jpg", rgb_bgr, JPEG_Q)
 
             # FPS
             now = time.monotonic()
@@ -314,7 +317,7 @@ def capture_loop():
             frame_times.append(now)
 
             state.update(rb.tobytes(), db.tobytes(),
-                         presence, conf, zh, zd, dist, lm_list, len(frame_times))
+                         presence, conf, zh, zd, dist, lm_list, len(frame_times), raw.tobytes())
 
         except Exception as e:
             print(f"capture error: {e}", flush=True)
@@ -355,8 +358,8 @@ app.add_middleware(
 # --- API ---
 @app.get("/feed/{stream}")
 async def feed(stream: str):
-    if stream not in ("rgb", "depth"):
-        return JSONResponse({"error": "unknown stream, use rgb or depth"}, 404)
+    if stream not in ("rgb", "depth", "raw"):
+        return JSONResponse({"error": "unknown stream, use rgb, depth or raw"}, 404)
     return StreamingResponse(mjpeg_gen(stream),
                              media_type="multipart/x-mixed-replace; boundary=frame")
 
