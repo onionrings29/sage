@@ -11,17 +11,20 @@ from typing import Optional
 
 import cv2
 import freenect
-import mediapipe as mp
 import numpy as np
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
-from mediapipe.tasks import python as mp_python
-from mediapipe.tasks.python import vision
 from pydantic import BaseModel
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(BASE_DIR, "models", "pose_landmarker.task")
+# Camera-only by default; pose inference is opt-in to preserve shared CPU capacity.
+POSE_ENABLED = os.environ.get("SAGE_POSE_ENABLED", "0") == "1"
+if POSE_ENABLED:
+    import mediapipe as mp
+    from mediapipe.tasks import python as mp_python
+    from mediapipe.tasks.python import vision
 
 # --- Hardware (ctypes for tilt/LED — broken on K4W, kept for Xbox Kinect compat) ---
 try:
@@ -126,7 +129,7 @@ class State:
         self.rgb_jpeg: Optional[bytes] = None
         self.depth_jpeg: Optional[bytes] = None
         self.raw_jpeg: Optional[bytes] = None  # clean RGB, no overlay (Frigate)
-        self.presence = False
+        self.presence = False if POSE_ENABLED else None
         self.confidence = 0.0
         self.zone_h = "unknown"
         self.zone_d = "unknown"
@@ -314,17 +317,19 @@ def capture_loop():
     lm_smoother = LandmarkSmoother(alpha=0.4)  # 0.4 = moderate smoothing
     # Depth smoothing removed — causes ghosting/doubling on movement
 
-    landmarker = vision.PoseLandmarker.create_from_options(
-        vision.PoseLandmarkerOptions(
-            base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
-            running_mode=vision.RunningMode.VIDEO,
-            num_poses=1,
-            min_pose_detection_confidence=0.5,
-            min_tracking_confidence=0.5,
+    landmarker = None
+    if POSE_ENABLED:
+        landmarker = vision.PoseLandmarker.create_from_options(
+            vision.PoseLandmarkerOptions(
+                base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
+                running_mode=vision.RunningMode.VIDEO,
+                num_poses=1,
+                min_pose_detection_confidence=0.5,
+                min_tracking_confidence=0.5,
+            )
         )
-    )
     start_time = time.monotonic()
-    print("Capture thread ready — heavy model loaded", flush=True)
+    print("Capture thread ready — " + ("pose inference enabled" if POSE_ENABLED else "camera-only; pose inference disabled"), flush=True)
 
     while True:
         try:
@@ -345,37 +350,37 @@ def capture_loop():
             depth = depth_raw
             rgb_bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
 
-            # MediaPipe detection
-            ts_ms = int((time.monotonic() - start_time) * 1000)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            result = landmarker.detect_for_video(mp_image, ts_ms)
-
-            presence = len(result.pose_landmarks) > 0
+            # Disabled inference is unknown presence, not an absence observation.
+            presence = None
             conf, zh, zd, dist, lm_list = 0.0, "unknown", "unknown", 0, None
-
             display_bgr = rgb_bgr
-            if presence:
-                raw_lm = result.pose_landmarks[0]
-                conf = round(float(np.mean([l.visibility for l in raw_lm])), 3)
-                if conf >= SEEN_CONF:
-                    state.last_seen = time.monotonic()
+            if landmarker is not None:
+                ts_ms = int((time.monotonic() - start_time) * 1000)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                result = landmarker.detect_for_video(mp_image, ts_ms)
+                presence = len(result.pose_landmarks) > 0
+                if presence:
+                    raw_lm = result.pose_landmarks[0]
+                    conf = round(float(np.mean([l.visibility for l in raw_lm])), 3)
+                    if conf >= SEEN_CONF:
+                        state.last_seen = time.monotonic()
 
-                # Smooth landmarks for stable display
-                smoothed = lm_smoother.smooth(raw_lm)
-                zh, zd, dist = compute_zone(smoothed, depth)
-                lm_list = [
-                    {"x": round(l["x"], 4), "y": round(l["y"], 4),
-                     "z": round(l["z"], 4), "v": round(l["v"], 3)}
-                    for l in smoothed
-                ]
-                display_bgr = draw_skeleton(rgb_bgr, smoothed)
-                cv2.putText(display_bgr, f"{zh} / {zd}", (10, 30),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 136), 2)
-                if dist > 0:
-                    cv2.putText(display_bgr, f"{dist / 1000:.1f}m", (10, 60),
+                    # Smooth landmarks for stable display
+                    smoothed = lm_smoother.smooth(raw_lm)
+                    zh, zd, dist = compute_zone(smoothed, depth)
+                    lm_list = [
+                        {"x": round(l["x"], 4), "y": round(l["y"], 4),
+                         "z": round(l["z"], 4), "v": round(l["v"], 3)}
+                        for l in smoothed
+                    ]
+                    display_bgr = draw_skeleton(rgb_bgr, smoothed)
+                    cv2.putText(display_bgr, f"{zh} / {zd}", (10, 30),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 136), 2)
-            else:
-                lm_smoother.reset()
+                    if dist > 0:
+                        cv2.putText(display_bgr, f"{dist / 1000:.1f}m", (10, 60),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 136), 2)
+                else:
+                    lm_smoother.reset()
 
             # Encode
             _, rb = cv2.imencode(".jpg", display_bgr, JPEG_Q)
@@ -439,7 +444,7 @@ async def feed(stream: str):
 async def get_status():
     s = state.snap()
     return {
-        "ok": True, "fps": s["fps"],
+        "ok": True, "fps": s["fps"], "pose_enabled": POSE_ENABLED,
         "presence": s["presence"], "confidence": s["confidence"],
         "zone": s["zone"], "depth_mode": state.depth_mode,
         "video_mode": state.video_mode, "video_mode_pref": state.video_mode_pref,
@@ -452,6 +457,7 @@ async def get_detections():
     s = state.snap()
     return {
         "frame_id": s["frame_id"],
+        "pose_enabled": POSE_ENABLED,
         "presence": s["presence"], "confidence": s["confidence"],
         "zone": s["zone"], "landmarks": s["landmarks"],
     }
@@ -516,6 +522,7 @@ async def ws_events(ws: WebSocket):
                 last_id = s["frame_id"]
                 await ws.send_json({
                     "frame_id": s["frame_id"],
+                    "pose_enabled": POSE_ENABLED,
                     "presence": s["presence"],
                     "confidence": s["confidence"],
                     "zone": s["zone"],
@@ -609,7 +616,13 @@ function connectWs() {
     const d = JSON.parse(e.data);
     fpsEl.textContent = d.fps;
     confEl.textContent = (d.confidence * 100).toFixed(0) + '%';
-    if (d.presence) {
+    if (d.pose_enabled === false) {
+      pDot.className = 'status-dot off';
+      pText.textContent = 'Pose detection disabled';
+      confEl.textContent = '\u2014';
+      zoneTag.textContent = '\u2014';
+      distText.textContent = '';
+    } else if (d.presence) {
       pDot.className = 'status-dot on';
       pText.textContent = 'Person detected';
       zoneTag.textContent = `${d.zone.horizontal.toUpperCase()} / ${d.zone.depth.toUpperCase()}`;
