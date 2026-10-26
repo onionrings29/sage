@@ -104,3 +104,9 @@ This rsyncs `kinect-service/` to CT 144 at `/opt/sage/kinect-service/`, download
 | 3 | ADHD/fidgeting metrics, study quality, posture scoring |
 | 4 | Frigate camera integration in Sage dashboard |
 | 5 | Cross-sensor behavioral synthesis (Sage brain) |
+
+## Camera-only operation (2026-10-25)
+
+The service defaults to camera-only mode (`SAGE_POSE_ENABLED=0`). It keeps raw/RGB/depth camera feeds and skips MediaPipe imports, model initialization and pose inference to preserve shared CPU capacity. `/status`, `/detections` and WebSocket events expose `pose_enabled: false`; `presence: null` means unavailable, not observed absence. The dashboard labels inference disabled. To intentionally restore pose inference, set `SAGE_POSE_ENABLED=1` in the service environment and restart. This flag does not control Frigate object detection or Tapo.
+
+Regression verification: `python3 -m unittest discover -s tests -v`.
